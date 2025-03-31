@@ -16,6 +16,9 @@ from pydub import AudioSegment
 from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QTextEdit, QHBoxLayout
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import os
+import threading
+import wave
+import tempfile
 
 BUFFER = 1024 * 2
 FMT = aud.paInt16
@@ -45,9 +48,10 @@ def bersihkan_teks(text):
 class SpectrumWorker(QThread):
     update_signal = pyqtSignal(np.ndarray)
     
-    def __init__(self):
+    def __init__(self, mode="mic"):
         super().__init__()
         self.running = True
+        self.mode = mode
         self.audio = aud.PyAudio()
         self.stream = self.audio.open(
             format=FMT,
@@ -56,17 +60,52 @@ class SpectrumWorker(QThread):
             input=True,
             frames_per_buffer=BUFFER
         )
+        self.tts_data = None
+        self.tts_pos = 0
+    
+    def set_tts_data(self, data, sample_rate):
+        if sample_rate != FREQ:
+            ratio = FREQ / sample_rate
+            n_samples = int(len(data) * ratio)
+            self.tts_data = np.interp(
+                np.linspace(0, len(data)-1, n_samples),
+                np.arange(len(data)),
+                data
+            )
+        else:
+            self.tts_data = data
+        self.tts_pos = 0
     
     def run(self):
         while self.running:
-            data = self.stream.read(BUFFER, exception_on_overflow=False)
-            data_int = np.frombuffer(data, dtype=np.int16)
-            self.update_signal.emit(data_int)
+            if self.mode == "mic":
+                data = self.stream.read(BUFFER, exception_on_overflow=False)
+                data_int = np.frombuffer(data, dtype=np.int16)
+                self.update_signal.emit(data_int)
+            elif self.mode == "tts" and self.tts_data is not None:
+                end_pos = min(self.tts_pos + BUFFER, len(self.tts_data))
+                if self.tts_pos < len(self.tts_data):
+                    chunk = self.tts_data[self.tts_pos:end_pos]
+                    if len(chunk) < BUFFER:
+                        chunk = np.pad(chunk, (0, BUFFER - len(chunk)), 'constant')
+                    chunk_int16 = (chunk * 32767).astype(np.int16)
+                    self.update_signal.emit(chunk_int16)
+                    self.tts_pos += BUFFER
+                    duration = BUFFER / FREQ
+                    threading.Event().wait(duration / 4)
+                else:
+                    self.tts_pos = 0
     
     def stop(self):
         self.running = False
         self.quit()
         self.wait()
+    
+    def switch_to_mic(self):
+        self.mode = "mic"
+    
+    def switch_to_tts(self):
+        self.mode = "tts"
 
 class SpeechRecognitionWorker(QThread):
     text_signal = pyqtSignal(str)
@@ -87,9 +126,9 @@ class SpeechRecognitionWorker(QThread):
             result = self.whisper_model.transcribe(temp_audio_file)
             text = result["text"].strip()
             
-            self.text_signal.emit(text if text else "❌ Tidak ada suara yang terdeteksi.")
+            self.text_signal.emit(text if text else "Tidak ada suara yang terdeteksi.")
         except Exception as e:
-            self.text_signal.emit(f"❌ Error saat menangkap suara: {e}")
+            self.text_signal.emit(f"Error saat menangkap suara: {e}")
 
 class RAGServerWorker(QThread):
     response_signal = pyqtSignal(str)
@@ -120,12 +159,13 @@ class RAGServerWorker(QThread):
             
             self.response_signal.emit(response_text)
         except Exception as e:
-            self.response_signal.emit(f"⚠️ Error: {e}")
+            self.response_signal.emit(f"Error: {e}")
         finally:
             client_socket.close()
 
 class TextToSpeechWorker(QThread):
     finished = pyqtSignal()
+    audio_ready = pyqtSignal(np.ndarray, int)
     
     def __init__(self, text):
         super().__init__()
@@ -135,18 +175,24 @@ class TextToSpeechWorker(QThread):
         try:
             lang = 'id' if detect(self.text) == 'id' else 'en'
             tts = gTTS(text=self.text, lang=lang)
-            tts.save("temp_tts.mp3")
             
-            audio = AudioSegment.from_mp3("temp_tts.mp3")
+            temp_file = "temp_tts.mp3"
+            tts.save(temp_file)
+            
+            audio = AudioSegment.from_mp3(temp_file)
             samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-            samples /= np.iinfo(audio.array_type).max
+            samples_normalized = samples / np.iinfo(audio.array_type).max
             
-            sd.play(samples, audio.frame_rate)
+            self.audio_ready.emit(samples_normalized, audio.frame_rate)
+            
+            sd.play(samples_normalized, audio.frame_rate)
             sd.wait()
-            os.remove("temp_tts.mp3")
+            
+            os.remove(temp_file)
             self.finished.emit()
         except Exception as e:
-            print(f"❌ Error saat menghasilkan suara: {e}")
+            print(f"Error saat menghasilkan suara: {e}")
+            self.finished.emit()
 
 class RAGVoiceAssistantApp(QWidget):
     def __init__(self):
@@ -164,7 +210,7 @@ class RAGVoiceAssistantApp(QWidget):
         
         self.figure, self.ax = plt.subplots()
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setVisible(False)  # Hide spectrum canvas initially
+        self.canvas.setVisible(False)
         self.x = np.arange(0, BUFFER, 1)
         self.line, = self.ax.plot(self.x, np.random.rand(BUFFER), 'r')
         self.ax.set_ylim(-60000, 60000)
@@ -192,6 +238,7 @@ class RAGVoiceAssistantApp(QWidget):
     def startListening(self):
         # Show spectrum animation when starting to listen
         self.canvas.setVisible(True)
+        self.spectrum_worker.switch_to_mic()
         self.spectrum_worker.running = True
         self.spectrum_worker.start()
         self.recordButton.setEnabled(False)
@@ -207,7 +254,7 @@ class RAGVoiceAssistantApp(QWidget):
         self.label.setText("Tekan tombol untuk mulai berbicara:")
         self.recordButton.setEnabled(True)
         if text:
-            self.responseText.setText(f"📝 Anda berkata: {text}\n\n🔄 Memproses...")
+            self.responseText.setText(f"📝 Anda berkata: {text}\n\n Memproses...")
             self.getAIResponse(text)
     
     def getAIResponse(self, text):
@@ -216,15 +263,25 @@ class RAGVoiceAssistantApp(QWidget):
         self.rag_worker.start()
     
     def displayResponse(self, response):
-        # Keep spectrum animation hidden when displaying response
         self.responseText.setText(response)
         self.tts_worker = TextToSpeechWorker(response)
+        self.tts_worker.audio_ready.connect(self.startTTSVisualization)
         self.tts_worker.finished.connect(self.onTTSFinished)
         self.tts_worker.start()
     
+    def startTTSVisualization(self, audio_data, sample_rate):
+        self.canvas.setVisible(True)
+        self.label.setText("Codex Berbicara...")
+        
+        self.spectrum_worker.set_tts_data(audio_data, sample_rate)
+        self.spectrum_worker.switch_to_tts()
+        self.spectrum_worker.running = True
+        self.spectrum_worker.start()
+    
     def onTTSFinished(self):
-        # Don't restart spectrum animation after TTS
-        pass
+        self.spectrum_worker.stop()
+        self.canvas.setVisible(False)
+        self.label.setText("Tekan tombol untuk mulai berbicara:")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
