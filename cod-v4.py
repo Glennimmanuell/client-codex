@@ -168,9 +168,10 @@ class TextToSpeechWorker(QThread):
     finished = pyqtSignal()
     audio_ready = pyqtSignal(np.ndarray, int)
     
-    def __init__(self, text):
+    def __init__(self, text, volume_boost=2.0):
         super().__init__()
         self.text = text
+        self.volume_boost = volume_boost
     
     def run(self):
         try:
@@ -183,10 +184,12 @@ class TextToSpeechWorker(QThread):
             audio = AudioSegment.from_mp3(temp_file)
             samples = np.array(audio.get_array_of_samples()).astype(np.float32)
             samples_normalized = samples / np.iinfo(audio.array_type).max
+            samples_boosted = np.clip(samples_normalized * self.volume_boost, -1.0, 1.0)
             
             self.audio_ready.emit(samples_normalized, audio.frame_rate)
+            self.audio_ready.emit(samples_boosted, audio.frame_rate)
             
-            sd.play(samples_normalized, audio.frame_rate)
+            sd.play(samples_boosted, audio.frame_rate)
             sd.wait()
             
             os.remove(temp_file)
