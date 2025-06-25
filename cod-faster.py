@@ -2,6 +2,7 @@ import sys
 import json
 import socket
 from faster_whisper import WhisperModel
+import whisper
 import re
 import struct
 import numpy as np
@@ -10,7 +11,7 @@ import soundfile as sf
 import pyaudio as aud
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QTextEdit, QHBoxLayout, QComboBox
+from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QTextEdit, QHBoxLayout, QComboBox, QGroupBox
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
 import os
@@ -19,6 +20,9 @@ import wave
 import tempfile
 import subprocess
 import io
+import time
+from gtts import gTTS
+import pygame
 
 BUFFER = 1024 * 2
 FMT = aud.paInt16
@@ -83,6 +87,38 @@ class PiperTTSModel:
             
         except Exception as e:
             print(f"Error in Piper TTS: {e}")
+            raise e
+
+class GTTSModel:
+    def __init__(self, lang='id', slow=False):
+        self.lang = lang
+        self.slow = slow
+        pygame.mixer.init()
+        
+    def generate_speech(self, text):
+        try:
+            temp_mp3 = tempfile.NamedTemporaryFile(suffix='.mp3', delete=False)
+            temp_mp3.close()
+            
+            tts = gTTS(text=text, lang=self.lang, slow=self.slow)
+            tts.save(temp_mp3.name)
+            
+            # Convert to wav for consistency
+            temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_wav.close()
+            
+            # Use pygame to load and convert
+            pygame.mixer.music.load(temp_mp3.name)
+            
+            # Read audio data using soundfile after conversion
+            audio_data, sample_rate = sf.read(temp_mp3.name)
+            
+            os.unlink(temp_mp3.name)
+            
+            return audio_data, sample_rate
+            
+        except Exception as e:
+            print(f"Error in gTTS: {e}")
             raise e
 
 class SpectrumWorker(QThread):
@@ -150,38 +186,66 @@ class SpectrumWorker(QThread):
 class SpeechRecognitionWorker(QThread):
     text_signal = pyqtSignal(str)
     
-    def __init__(self, whisper_model):
+    def __init__(self, whisper_model, faster_whisper_model, use_faster_whisper=True):
         super().__init__()
         self.whisper_model = whisper_model
+        self.faster_whisper_model = faster_whisper_model
+        self.use_faster_whisper = use_faster_whisper
     
     def run(self):
         try:
             duration = 5
             sample_rate = 16000
             
-            print("Mulai merekam selama %d detik..." % duration)
+            print("=" * 60)
+            print("🎤 STT PROCESSING START")
+            print(f"🔧 Using: {'Faster-Whisper' if self.use_faster_whisper else 'OpenAI Whisper'}")
+            
+            stt_start_time = time.time()
+            
+            print(f"📹 Recording for {duration} seconds...")
+            record_start = time.time()
             
             audio_data = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype="int16")
             sd.wait()
             
+            record_end = time.time()
+            print(f"⏱️  Recording time: {record_end - record_start:.2f} seconds")
+            
             temp_audio_file = "temp_recorded.wav"
             sf.write(temp_audio_file, audio_data, sample_rate)
             
-            print("Rekaman selesai. Mulai transkripsi dengan faster-whisper...")
+            transcribe_start = time.time()
             
-            segments, info = self.whisper_model.transcribe(
-                temp_audio_file, 
-                beam_size=5,
-                language=None,
-                condition_on_previous_text=False
-            )
+            if self.use_faster_whisper:
+                print("🚀 Starting transcription with Faster-Whisper...")
+                segments, info = self.faster_whisper_model.transcribe(
+                    temp_audio_file, 
+                    beam_size=5,
+                    language=None,
+                    condition_on_previous_text=False
+                )
+                
+                print(f"🌍 Detected language: '{info.language}' (probability: {info.language_probability:.2f})")
+                
+                transcribed_text = ""
+                for segment in segments:
+                    print(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
+                    transcribed_text += segment.text + " "
+            else:
+                print("🔄 Starting transcription with OpenAI Whisper...")
+                result = self.whisper_model.transcribe(temp_audio_file)
+                transcribed_text = result["text"]
+                print(f"🌍 Detected language: {result.get('language', 'unknown')}")
+                print(f"📝 Transcribed text: {transcribed_text}")
             
-            print("Detected language '%s' with probability %f" % (info.language, info.language_probability))
+            transcribe_end = time.time()
+            stt_end_time = time.time()
             
-            transcribed_text = ""
-            for segment in segments:
-                print("[%.2fs -> %.2fs] %s" % (segment.start, segment.end, segment.text))
-                transcribed_text += segment.text + " "
+            print(f"⏱️  Transcription time: {transcribe_end - transcribe_start:.2f} seconds")
+            print(f"⏱️  Total STT time: {stt_end_time - stt_start_time:.2f} seconds")
+            print("✅ STT PROCESSING COMPLETE")
+            print("=" * 60)
             
             if os.path.exists(temp_audio_file):
                 os.remove(temp_audio_file)
@@ -190,7 +254,8 @@ class SpeechRecognitionWorker(QThread):
             self.text_signal.emit(text if text else "Tidak ada suara yang terdeteksi.")
             
         except Exception as e:
-            print(f"Error saat speech recognition: {e}")
+            print(f"❌ Error during speech recognition: {e}")
+            print("=" * 60)
             self.text_signal.emit(f"Error saat menangkap suara: {e}")
 
 class RAGServerWorker(QThread):
@@ -230,23 +295,56 @@ class TextToSpeechWorker(QThread):
     finished = pyqtSignal()
     audio_ready = pyqtSignal(np.ndarray, int)
     
-    def __init__(self, text, voice_model="model.onnx", volume_boost=2.0):
+    def __init__(self, text, voice_model="model.onnx", volume_boost=2.0, use_piper=True):
         super().__init__()
         self.text = text
         self.volume_boost = volume_boost
-        self.piper_model = PiperTTSModel(model_path=voice_model)
+        self.use_piper = use_piper
+        if use_piper:
+            self.piper_model = PiperTTSModel(model_path=voice_model)
+        else:
+            self.gtts_model = GTTSModel()
     
     def run(self):
         try:
-            audio_data, sample_rate = self.piper_model.generate_speech(self.text, self.volume_boost)
+            print("=" * 60)
+            print("🔊 TTS PROCESSING START")
+            print(f"🔧 Using: {'Piper TTS' if self.use_piper else 'Google TTS'}")
+            
+            tts_start_time = time.time()
+            
+            if self.use_piper:
+                print("🚀 Generating speech with Piper TTS...")
+                synthesis_start = time.time()
+                audio_data, sample_rate = self.piper_model.generate_speech(self.text, self.volume_boost)
+                synthesis_end = time.time()
+                print(f"⏱️  Piper synthesis time: {synthesis_end - synthesis_start:.2f} seconds")
+            else:
+                print("🌐 Generating speech with Google TTS...")
+                synthesis_start = time.time()
+                audio_data, sample_rate = self.gtts_model.generate_speech(self.text)
+                synthesis_end = time.time()
+                print(f"⏱️  gTTS synthesis time: {synthesis_end - synthesis_start:.2f} seconds")
+            
             self.audio_ready.emit(audio_data, sample_rate)
             
+            playback_start = time.time()
+            print("🎵 Starting audio playback...")
             sd.play(audio_data, sample_rate)
             sd.wait()
+            playback_end = time.time()
+            
+            tts_end_time = time.time()
+            
+            print(f"⏱️  Audio playback time: {playback_end - playback_start:.2f} seconds")
+            print(f"⏱️  Total TTS time: {tts_end_time - tts_start_time:.2f} seconds")
+            print("✅ TTS PROCESSING COMPLETE")
+            print("=" * 60)
             
             self.finished.emit()
         except Exception as e:
-            print(f"Error saat menghasilkan suara: {e}")
+            print(f"❌ Error during TTS generation: {e}")
+            print("=" * 60)
             self.finished.emit()
 
 def create_dark_palette():
@@ -274,35 +372,70 @@ class RAGVoiceAssistantApp(QWidget):
         # self.rag_server_host = "spin5.petra.ac.id"
         self.rag_server_port = 50001
         
-        print("Loading faster-whisper model...")
-        model_size = "small"
-        try:
-            self.whisper_model = WhisperModel(
-                model_size, 
-                device="cuda",
-                compute_type="int8"
-            )
-            print(f"Faster-whisper model '{model_size}' loaded successfully!")
-        except Exception as e:
-            print(f"Error loading faster-whisper model: {e}")
+        # Initialize models
+        print("🚀 Initializing AI models...")
+        self.init_whisper_models()
+        self.init_tts_models()
         
         self.spectrum_worker = SpectrumWorker()
         self.spectrum_worker.update_signal.connect(self.updateSpectrum)
         
-        self.voice_model_path = "model.onnx"
         self.volume_boost = 2.0
+    
+    def init_whisper_models(self):
+        print("📡 Loading STT models...")
+        model_size = "small"
         
+        try:
+            print("🔄 Loading Faster-Whisper model...")
+            start_time = time.time()
+            self.faster_whisper_model = WhisperModel(
+                model_size, 
+                device="cuda",
+                compute_type="int8"
+            )
+            end_time = time.time()
+            print(f"✅ Faster-Whisper model '{model_size}' loaded in {end_time - start_time:.2f} seconds")
+        except Exception as e:
+            print(f"❌ Error loading Faster-Whisper model: {e}")
+            self.faster_whisper_model = None
+        
+        try:
+            print("🔄 Loading OpenAI Whisper model...")
+            start_time = time.time()
+            self.whisper_model = whisper.load_model(model_size)
+            end_time = time.time()
+            print(f"✅ OpenAI Whisper model '{model_size}' loaded in {end_time - start_time:.2f} seconds")
+        except Exception as e:
+            print(f"❌ Error loading OpenAI Whisper model: {e}")
+            self.whisper_model = None
+    
+    def init_tts_models(self):
+        print("🔊 Initializing TTS models...")
+        
+        # Find voice models for Piper
         self.voice_models = self.find_voice_models()
         if self.voice_models and len(self.voice_models) > 0:
             self.voice_model_path = self.voice_models[0]
-            print(f"Found voice model: {self.voice_model_path}")
+            print(f"✅ Found Piper voice model: {self.voice_model_path}")
+            try:
+                self.piper_model = PiperTTSModel(model_path=self.voice_model_path)
+                print("✅ Piper TTS model initialized successfully")
+            except Exception as e:
+                print(f"❌ Error setting up Piper model: {e}")
+                self.piper_model = None
+        else:
+            print("⚠️  No Piper voice models (.onnx files) found")
+            self.piper_model = None
+            self.voice_model_path = None
         
+        # Initialize gTTS
         try:
-            self.piper_model = PiperTTSModel(model_path=self.voice_model_path)
-            print("Piper TTS model setup successfully")
+            self.gtts_model = GTTSModel()
+            print("✅ Google TTS model initialized successfully")
         except Exception as e:
-            print(f"Error setting up Piper model: {e}")
-            print("Please ensure you have a valid Piper voice model (.onnx file)")
+            print(f"❌ Error setting up gTTS model: {e}")
+            self.gtts_model = None
     
     def find_voice_models(self):
         """Find all .onnx files that might be piper voice models"""
@@ -316,8 +449,8 @@ class RAGVoiceAssistantApp(QWidget):
         return models
     
     def initUI(self):
-        self.setWindowTitle("Smart Lab Expert")
-        self.setGeometry(100, 100, 800, 400)
+        self.setWindowTitle("Smart Lab Expert - Enhanced Voice Assistant")
+        self.setGeometry(100, 100, 900, 600)
         
         plt.style.use('dark_background')
         self.figure, self.ax = plt.subplots(facecolor='black')
@@ -329,10 +462,73 @@ class RAGVoiceAssistantApp(QWidget):
         self.ax.set_xlim(0, BUFFER)
         self.ax.axis("off")
         
+        # Main layout
+        layout = QVBoxLayout()
+        
+        # Status and info
         self.label = QLabel("Tekan tombol untuk mulai berbicara:", self)
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setStyleSheet("color: white; font-size: 12pt;")
         
+        self.statusLabel = QLabel("🚀 Ready - Select your preferred STT and TTS options", self)
+        self.statusLabel.setAlignment(Qt.AlignCenter)
+        self.statusLabel.setStyleSheet("color: #00ff00; font-size: 10pt; padding: 5px;")
+        
+        # Settings Group
+        settingsGroup = QGroupBox("AI Model Settings")
+        settingsGroup.setStyleSheet("""
+            QGroupBox {
+                color: white;
+                border: 2px solid #3a3a3a;
+                border-radius: 5px;
+                margin-top: 1ex;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+        """)
+        
+        settingsLayout = QVBoxLayout()
+        
+        # STT Settings
+        sttLayout = QHBoxLayout()
+        sttLayout.addWidget(QLabel("Speech-to-Text:", self))
+        self.sttSelector = QComboBox(self)
+        self.sttSelector.addItems(["Faster-Whisper", "OpenAI Whisper"])
+        self.sttSelector.setStyleSheet(self.get_combobox_style())
+        sttLayout.addWidget(self.sttSelector)
+        
+        # TTS Settings
+        ttsLayout = QHBoxLayout()
+        ttsLayout.addWidget(QLabel("Text-to-Speech:", self))
+        self.ttsSelector = QComboBox(self)
+        self.ttsSelector.addItems(["Piper TTS", "Google TTS"])
+        self.ttsSelector.setStyleSheet(self.get_combobox_style())
+        ttsLayout.addWidget(self.ttsSelector)
+        
+        # Voice Model Settings (for Piper)
+        voiceModelLayout = QHBoxLayout()
+        voiceModelLayout.addWidget(QLabel("Piper Voice Model:", self))
+        self.voiceModelSelector = QComboBox(self)
+        self.voice_models = self.find_voice_models()
+        if self.voice_models:
+            self.voiceModelSelector.addItems(self.voice_models)
+            self.voiceModelSelector.currentTextChanged.connect(self.changeVoiceModel)
+        else:
+            self.voiceModelSelector.addItem("No voice models found")
+            self.voiceModelSelector.setEnabled(False)
+        self.voiceModelSelector.setStyleSheet(self.get_combobox_style())
+        voiceModelLayout.addWidget(self.voiceModelSelector)
+        
+        settingsLayout.addLayout(sttLayout)
+        settingsLayout.addLayout(ttsLayout)
+        settingsLayout.addLayout(voiceModelLayout)
+        settingsGroup.setLayout(settingsLayout)
+        
+        # Record button
         self.recordButton = QPushButton("🎤 Mulai Bicara", self)
         self.recordButton.clicked.connect(self.startListening)
         self.recordButton.setStyleSheet("""
@@ -341,8 +537,9 @@ class RAGVoiceAssistantApp(QWidget):
                 color: white; 
                 border: 1px solid #5c5c5c;
                 border-radius: 4px;
-                padding: 6px;
-                font-size: 12pt;
+                padding: 8px;
+                font-size: 14pt;
+                font-weight: bold;
             }
             QPushButton:hover {
                 background-color: #2a2a2a;
@@ -356,6 +553,7 @@ class RAGVoiceAssistantApp(QWidget):
             }
         """)
         
+        # Response text area
         self.responseText = QTextEdit(self)
         self.responseText.setReadOnly(True)
         self.responseText.setStyleSheet("""
@@ -369,15 +567,19 @@ class RAGVoiceAssistantApp(QWidget):
             }
         """)
         
-        self.voice_models = self.find_voice_models()
-        self.voiceModelSelector = QComboBox(self)
-        if self.voice_models:
-            self.voiceModelSelector.addItems(self.voice_models)
-            self.voiceModelSelector.currentTextChanged.connect(self.changeVoiceModel)
-        else:
-            self.voiceModelSelector.addItem("No voice models found")
-            self.voiceModelSelector.setEnabled(False)
-        self.voiceModelSelector.setStyleSheet("""
+        # Add all components to layout
+        layout.addWidget(self.canvas)
+        layout.addWidget(self.label)
+        layout.addWidget(self.statusLabel)
+        layout.addWidget(settingsGroup)
+        layout.addWidget(self.recordButton)
+        layout.addWidget(self.responseText)
+        
+        self.setStyleSheet("background-color: black;")
+        self.setLayout(layout)
+    
+    def get_combobox_style(self):
+        return """
             QComboBox {
                 background-color: #1a1a1a; 
                 color: white; 
@@ -385,6 +587,7 @@ class RAGVoiceAssistantApp(QWidget):
                 border-radius: 4px;
                 padding: 6px;
                 font-size: 10pt;
+                min-width: 150px;
             }
             QComboBox:hover {
                 background-color: #2a2a2a;
@@ -393,27 +596,9 @@ class RAGVoiceAssistantApp(QWidget):
                 background-color: #1a1a1a;
                 color: white;
                 selection-background-color: #2a2a2a;
+                border: 1px solid #5c5c5c;
             }
-        """)
-        
-        self.statusLabel = QLabel("🚀 Menggunakan Faster-Whisper + Piper TTS", self)
-        self.statusLabel.setAlignment(Qt.AlignCenter)
-        self.statusLabel.setStyleSheet("color: #00ff00; font-size: 10pt; padding: 5px;")
-        
-        voiceModelLayout = QHBoxLayout()
-        voiceModelLayout.addWidget(QLabel("Voice Model:", self))
-        voiceModelLayout.addWidget(self.voiceModelSelector)
-        
-        layout = QVBoxLayout()
-        layout.addWidget(self.canvas)
-        layout.addWidget(self.label)
-        layout.addWidget(self.statusLabel)
-        layout.addWidget(self.recordButton)
-        layout.addLayout(voiceModelLayout)
-        layout.addWidget(self.responseText)
-        
-        self.setStyleSheet("background-color: black;")
-        self.setLayout(layout)
+        """
     
     def changeVoiceModel(self, model_name):
         """Change the current voice model to the selected one"""
@@ -421,23 +606,40 @@ class RAGVoiceAssistantApp(QWidget):
             self.voice_model_path = model_name
             try:
                 self.piper_model = PiperTTSModel(model_path=self.voice_model_path)
-                print(f"Changed voice model to: {model_name}")
+                print(f"🔄 Changed Piper voice model to: {model_name}")
             except Exception as e:
-                print(f"Error changing voice model: {e}")
+                print(f"❌ Error changing voice model: {e}")
     
     def updateSpectrum(self, data):
         self.line.set_ydata(data)
         self.canvas.draw()
     
     def startListening(self):
+        use_faster_whisper = self.sttSelector.currentText() == "Faster-Whisper"
+        
+        # Check if selected STT model is available
+        if use_faster_whisper and not self.faster_whisper_model:
+            self.responseText.setText("❌ Faster-Whisper model not available. Please select OpenAI Whisper.")
+            return
+        elif not use_faster_whisper and not self.whisper_model:
+            self.responseText.setText("❌ OpenAI Whisper model not available. Please select Faster-Whisper.")
+            return
+        
         self.canvas.setVisible(True)
         self.spectrum_worker.switch_to_mic()
         self.spectrum_worker.running = True
         self.spectrum_worker.start()
         self.recordButton.setEnabled(False)
-        self.label.setText("🎧 Mendengarkan...")
-        self.statusLabel.setText("🚀 Faster-Whisper sedang memproses audio...")
-        self.sr_worker = SpeechRecognitionWorker(self.whisper_model)
+        
+        stt_method = "Faster-Whisper" if use_faster_whisper else "OpenAI Whisper"
+        self.label.setText(f"🎧 Mendengarkan... ({stt_method})")
+        self.statusLabel.setText(f"🚀 {stt_method} sedang memproses audio...")
+        
+        self.sr_worker = SpeechRecognitionWorker(
+            self.whisper_model, 
+            self.faster_whisper_model,
+            use_faster_whisper
+        )
         self.sr_worker.text_signal.connect(self.processSpeech)
         self.sr_worker.start()
     
@@ -445,7 +647,11 @@ class RAGVoiceAssistantApp(QWidget):
         self.spectrum_worker.stop()
         self.canvas.setVisible(False)
         self.label.setText("Tekan tombol untuk mulai berbicara:")
-        self.statusLabel.setText("🚀 Menggunakan Faster-Whisper + Piper TTS")
+        
+        stt_method = self.sttSelector.currentText()
+        tts_method = self.ttsSelector.currentText()
+        self.statusLabel.setText(f"🚀 Using {stt_method} + {tts_method}")
+        
         self.recordButton.setEnabled(True)
         if text:
             self.responseText.setText(f"📝 Anda berkata: {text}\n\n🔄 Memproses...")
@@ -461,11 +667,22 @@ class RAGVoiceAssistantApp(QWidget):
         clean_response = bersihkan_teks(response)
         self.responseText.setText(clean_response)
         
-        # Start text-to-speech with Piper TTS only
+        use_piper = self.ttsSelector.currentText() == "Piper TTS"
+        
+        # Check if selected TTS model is available
+        if use_piper and not self.piper_model:
+            self.responseText.append("\n\n❌ Piper TTS model not available. Switching to Google TTS.")
+            use_piper = False
+        elif not use_piper and not self.gtts_model:
+            self.responseText.append("\n\n❌ Google TTS not available. Please check your internet connection.")
+            return
+        
+        # Start text-to-speech
         self.tts_worker = TextToSpeechWorker(
             clean_response, 
-            voice_model=self.voice_model_path,
-            volume_boost=self.volume_boost
+            voice_model=self.voice_model_path if use_piper else None,
+            volume_boost=self.volume_boost,
+            use_piper=use_piper
         )
         self.tts_worker.audio_ready.connect(self.startTTSVisualization)
         self.tts_worker.finished.connect(self.onTTSFinished)
@@ -473,8 +690,12 @@ class RAGVoiceAssistantApp(QWidget):
     
     def startTTSVisualization(self, audio_data, sample_rate):
         self.canvas.setVisible(True)
-        model_name = os.path.basename(self.voice_model_path)
-        self.label.setText(f"🔊 Codex Berbicara (Piper: {model_name})...")
+        
+        if self.ttsSelector.currentText() == "Piper TTS":
+            model_name = os.path.basename(self.voice_model_path) if self.voice_model_path else "Unknown"
+            self.label.setText(f"🔊 Codex Berbicara (Piper: {model_name})...")
+        else:
+            self.label.setText("🔊 Codex Berbicara (Google TTS)...")
         
         self.spectrum_worker.set_tts_data(audio_data, sample_rate)
         self.spectrum_worker.switch_to_tts()
@@ -487,6 +708,15 @@ class RAGVoiceAssistantApp(QWidget):
         self.label.setText("Tekan tombol untuk mulai berbicara:")
 
 if __name__ == "__main__":
+    print("🚀 Smart Lab Expert - Enhanced Voice Assistant")
+    print("=" * 60)
+    print("Features:")
+    print("🎤 STT Options: Faster-Whisper vs OpenAI Whisper")
+    print("🔊 TTS Options: Piper TTS vs Google TTS")
+    print("⏱️  Performance tracking with detailed timing")
+    print("🎨 Dark theme UI with spectrum visualization")
+    print("=" * 60)
+    
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setPalette(create_dark_palette())
