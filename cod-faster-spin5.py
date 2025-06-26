@@ -1,5 +1,4 @@
 import json
-import socket
 import re
 import numpy as np
 import sounddevice as sd
@@ -10,6 +9,15 @@ import subprocess
 import time
 from gtts import gTTS
 import threading
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    StorageContext,
+    load_index_from_storage,
+    Settings
+)
+from llama_index.embeddings.fastembed import FastEmbedEmbedding
+from llama_index.llms.ollama import Ollama
 
 def bersihkan_teks(text):
     """Clean and format response text"""
@@ -88,11 +96,186 @@ class GTTSModel:
             print(f"Error in gTTS: {e}")
             raise e
 
-class TerminalVoiceAssistant:
+class RAGSystem:
+    """Integrated RAG System"""
     def __init__(self):
-        self.rag_server_host = "spin5.petra.ac.id"
-        self.rag_server_port = 50001
+        self.PERSIST_DIR = "./vector_db"
+        self.DOCS_DIR = "./Docs"
+        self.chat_engine = None
+        self.init_rag()
+    
+    def init_rag(self):
+        """Initialize RAG system"""
+        try:
+            print("🚀 Initializing RAG System...")
+            
+            # Configure LlamaIndex
+            embed_model = FastEmbedEmbedding(model_name="intfloat/multilingual-e5-large")
+            llm = Ollama(model="gemma2:latest", base_url="http://spin5.petra.ac.id:11434", request_timeout=120.0)
+            Settings.llm = llm
+            Settings.embed_model = embed_model
+            
+            # Check if Docs directory exists and has files
+            if not os.path.exists(self.DOCS_DIR) or not os.listdir(self.DOCS_DIR):
+                print(f"⚠️  Warning: No documents found in {self.DOCS_DIR}")
+                print("Creating dummy index for testing...")
+                # Create a minimal index for testing
+                from llama_index.core import Document
+                dummy_doc = Document(text="This is a test document for the RAG system.")
+                index = VectorStoreIndex.from_documents([dummy_doc])
+            else:
+                # Load or create index
+                if not os.path.exists(self.PERSIST_DIR):
+                    print(f"📄 Loading documents from {self.DOCS_DIR}...")
+                    documents = SimpleDirectoryReader(self.DOCS_DIR).load_data()
+                    print(f"✅ Loaded {len(documents)} documents.")
+
+                    print("🔨 Building VectorStoreIndex...")
+                    index = VectorStoreIndex.from_documents(documents)
+                    index.storage_context.persist(persist_dir=self.PERSIST_DIR)
+                else:
+                    print("📦 Loading existing VectorStoreIndex from storage...")
+                    storage_context = StorageContext.from_defaults(persist_dir=self.PERSIST_DIR)
+                    index = load_index_from_storage(storage_context)
+            
+            # Create chat engine
+            self.chat_engine = index.as_chat_engine()
+            print("✅ RAG System initialized successfully!")
+            
+        except Exception as e:
+            print(f"❌ Error initializing RAG system: {e}")
+            self.chat_engine = None
+    
+    def convert_numbers_to_text(self, text):
+        """Convert numbers in text to Indonesian words"""
+        numbers_dict = {
+            '0': 'nol', '1': 'satu', '2': 'dua', '3': 'tiga', '4': 'empat',
+            '5': 'lima', '6': 'enam', '7': 'tujuh', '8': 'delapan', '9': 'sembilan',
+            '10': 'sepuluh', '11': 'sebelas', '12': 'dua belas', '13': 'tiga belas',
+            '14': 'empat belas', '15': 'lima belas', '16': 'enam belas',
+            '17': 'tujuh belas', '18': 'delapan belas', '19': 'sembilan belas',
+            '20': 'dua puluh', '30': 'tiga puluh', '40': 'empat puluh',
+            '50': 'lima puluh', '60': 'enam puluh', '70': 'tujuh puluh',
+            '80': 'delapan puluh', '90': 'sembilan puluh', '100': 'seratus',
+            '1000': 'seribu', '1000000': 'satu juta', '1000000000': 'satu miliar'
+        }
+        
+        def number_to_indonesian(num):
+            if num == 0:
+                return 'nol'
+            
+            if str(num) in numbers_dict:
+                return numbers_dict[str(num)]
+            
+            # Handle 21-99
+            if 21 <= num <= 99:
+                tens = (num // 10) * 10
+                ones = num % 10
+                if ones == 0:
+                    return numbers_dict[str(tens)]
+                else:
+                    return f"{numbers_dict[str(tens)]} {numbers_dict[str(ones)]}"
+            
+            # Handle 101-999
+            if 101 <= num <= 999:
+                hundreds = num // 100
+                remainder = num % 100
+                result = f"{numbers_dict[str(hundreds)]} ratus"
+                if remainder > 0:
+                    result += f" {number_to_indonesian(remainder)}"
+                return result
+            
+            # Handle 1001-9999
+            if 1001 <= num <= 9999:
+                thousands = num // 1000
+                remainder = num % 1000
+                if thousands == 1:
+                    result = "seribu"
+                else:
+                    result = f"{number_to_indonesian(thousands)} ribu"
+                if remainder > 0:
+                    result += f" {number_to_indonesian(remainder)}"
+                return result
+            
+            # Handle 10000-999999
+            if 10000 <= num <= 999999:
+                thousands = num // 1000
+                remainder = num % 1000
+                result = f"{number_to_indonesian(thousands)} ribu"
+                if remainder > 0:
+                    result += f" {number_to_indonesian(remainder)}"
+                return result
+            
+            # Handle 1000000+
+            if num >= 1000000:
+                millions = num // 1000000
+                remainder = num % 1000000
+                result = f"{number_to_indonesian(millions)} juta"
+                if remainder > 0:
+                    result += f" {number_to_indonesian(remainder)}"
+                return result
+            
+            return str(num)
+        
+        def replace_number(match):
+            number_str = match.group()
+            try:
+                clean_number = number_str.replace(',', '').replace('.', '')
+                
+                if '.' in number_str and number_str.count('.') == 1:
+                    parts = number_str.split('.')
+                    if len(parts[1]) <= 2:
+                        integer_part = int(parts[0].replace(',', ''))
+                        decimal_part = parts[1]
+                        result = number_to_indonesian(integer_part)
+                        if decimal_part != '0' and decimal_part != '00':
+                            result += f" koma {' '.join([numbers_dict.get(d, d) for d in decimal_part])}"
+                        return result
+                
+                num = int(clean_number)
+                return number_to_indonesian(num)
+            except ValueError:
+                return number_str
+        
+        number_pattern = r'\b\d{1,3}(?:[,.]\d{3})*(?:\.\d{1,2})?\b|\b\d+\b'
+        converted_text = re.sub(number_pattern, replace_number, text)
+        
+        return converted_text
+    
+    def get_response(self, prompt):
+        """Get response from RAG system"""
+        try:
+            if not self.chat_engine:
+                return "RAG system tidak tersedia. Silakan periksa konfigurasi."
+            
+            start_time = time.time()
+            print(f"🤖 Processing prompt: {prompt[:50]}...")
+            
+            response = self.chat_engine.chat(prompt)
+            response_text = str(response)
+            
+            # Convert numbers to text
+            response_text = self.convert_numbers_to_text(response_text)
+            
+            # Remove unwanted parts for display
+            filtered_response = re.sub(r"\*\*.*?\*\*|<think>.*?</think>", "", response_text).strip()
+            
+            end_time = time.time()
+            print(f"⏱️  Response generated in {end_time - start_time:.2f} seconds")
+            
+            return response_text
+            
+        except Exception as e:
+            print(f"❌ Error generating response: {e}")
+            return "Terjadi kesalahan saat memproses permintaan."
+
+class IntegratedVoiceAssistant:
+    def __init__(self):
         self.volume_boost = 2.0
+        
+        # Initialize RAG system
+        print("🚀 Initializing RAG System...")
+        self.rag_system = RAGSystem()
         
         # Initialize TTS models
         print("🚀 Initializing TTS models...")
@@ -140,32 +323,6 @@ class TerminalVoiceAssistant:
         except Exception as e:
             print(f"Error finding voice models: {e}")
         return models
-    
-    def get_ai_response(self, prompt):
-        """Get response from RAG server"""
-        try:
-            print("🔄 Connecting to AI server...")
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.connect((self.rag_server_host, self.rag_server_port))
-            
-            request_data = json.dumps({"prompt": prompt}, ensure_ascii=False)
-            client_socket.sendall(request_data.encode('utf-8') + b'\n')
-            
-            data = b""
-            while True:
-                chunk = client_socket.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-
-            response_json = json.loads(data.decode('utf-8', errors='ignore'))
-            response_text = response_json.get("response", "").strip()
-            
-            return response_text
-        except Exception as e:
-            return f"Error connecting to server: {e}"
-        finally:
-            client_socket.close()
     
     def text_to_speech(self, text):
         """Convert text to speech and play it"""
@@ -218,7 +375,7 @@ class TerminalVoiceAssistant:
         if self.use_piper and self.current_voice_model:
             print(f"🎤 Voice Model: {self.current_voice_model}")
         print(f"🔈 Volume Boost: {self.volume_boost}x")
-        print(f"🖥️  Server: {self.rag_server_host}:{self.rag_server_port}")
+        print(f"🤖 RAG System: {'Active' if self.rag_system.chat_engine else 'Inactive'}")
         print("=" * 50)
     
     def change_settings(self):
@@ -230,11 +387,10 @@ class TerminalVoiceAssistant:
             print("1. Toggle TTS Engine (Piper/Google)")
             print("2. Change Voice Model (Piper only)")
             print("3. Change Volume Boost")
-            print("4. Change Server Address")
-            print("5. Show Current Settings")
-            print("6. Back to Main Menu")
+            print("4. Show Current Settings")
+            print("5. Back to Main Menu")
             
-            choice = input("\nPilih opsi (1-6): ").strip()
+            choice = input("\nPilih opsi (1-5): ").strip()
             
             if choice == "1":
                 self.use_piper = not self.use_piper
@@ -274,20 +430,9 @@ class TerminalVoiceAssistant:
                     print("❌ Invalid number format")
                     
             elif choice == "4":
-                new_host = input(f"Current server: {self.rag_server_host}\nEnter new server address: ").strip()
-                if new_host:
-                    try:
-                        new_port = int(input(f"Current port: {self.rag_server_port}\nEnter new port: "))
-                        self.rag_server_host = new_host
-                        self.rag_server_port = new_port
-                        print(f"✅ Server changed to: {self.rag_server_host}:{self.rag_server_port}")
-                    except ValueError:
-                        print("❌ Invalid port number")
-                        
-            elif choice == "5":
                 self.show_settings()
                 
-            elif choice == "6":
+            elif choice == "5":
                 break
                 
             else:
@@ -295,14 +440,15 @@ class TerminalVoiceAssistant:
     
     def run(self):
         """Main application loop"""
-        print("🚀 Smart Lab Expert - Terminal Voice Assistant")
-        print("=" * 60)
+        print("🚀 Smart Lab Expert - Integrated Voice Assistant with RAG")
+        print("=" * 70)
         print("Features:")
         print("⌨️  Terminal Input: Type your questions directly")
+        print("🤖 Integrated RAG: Direct document-based AI responses")
         print("🔊 TTS Options: Piper TTS vs Google TTS")
         print("⏱️  Performance tracking with detailed timing")
         print("⚙️  Interactive settings menu")
-        print("=" * 60)
+        print("=" * 70)
         
         self.show_settings()
         
@@ -323,10 +469,10 @@ class TerminalVoiceAssistant:
                     print("❌ Pertanyaan tidak boleh kosong!")
                     continue
                 
-                print(f"\n📤 Mengirim pertanyaan: {question}")
+                print(f"\n📤 Memproses pertanyaan: {question}")
                 
-                # Get AI response
-                response = self.get_ai_response(question)
+                # Get AI response from integrated RAG
+                response = self.rag_system.get_response(question)
                 
                 # Clean and display response
                 clean_response = bersihkan_teks(response)
@@ -352,7 +498,7 @@ class TerminalVoiceAssistant:
                 print("❌ Invalid option")
 
 if __name__ == "__main__":
-    assistant = TerminalVoiceAssistant()
+    assistant = IntegratedVoiceAssistant()
     try:
         assistant.run()
     except KeyboardInterrupt:
